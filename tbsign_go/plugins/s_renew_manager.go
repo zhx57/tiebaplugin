@@ -1,0 +1,777 @@
+package _plugin
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	_function "github.com/BANKA2017/tbsign_go/functions"
+	"github.com/BANKA2017/tbsign_go/model"
+	_type "github.com/BANKA2017/tbsign_go/types"
+	"github.com/kdnetwork/code-snippet/go/utils"
+	"github.com/labstack/echo/v4"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+func init() {
+	PluginList.Register(RenewManager)
+}
+
+type RenewManagerType struct {
+	PluginInfo
+}
+
+var RenewManager = _function.VPtr(RenewManagerType{
+	PluginInfo{
+		Name:              "kd_renew_manager",
+		PluginNameCN:      "吧主考核",
+		PluginNameCNShort: "吧主考核",
+		PluginNameFE:      "renew_manager",
+		Version:           "0.2",
+		Options: map[string]string{
+			"kd_renew_manager_id":           "0",
+			"kd_renew_manager_action_limit": "50",
+		},
+		SettingOptions: map[string]PluginSettingOption{
+			"kd_renew_manager_action_limit": {
+				OptionName:   "kd_renew_manager_action_limit",
+				OptionNameCN: "每分钟最大执行数",
+				Validate: &_function.OptionRule{
+					Min: _function.VPtr(int64(0)),
+				},
+			},
+		},
+		Test: false,
+		Endpoints: []PluginEndpointStruct{
+			{Method: http.MethodGet, Path: "switch", Function: PluginRenewManagerGetSwitch},
+			{Method: http.MethodPost, Path: "switch", Function: PluginRenewManagerSwitch},
+			{Method: http.MethodGet, Path: "settings", Function: PluginRenewManagerGetSettings},
+			{Method: http.MethodPost, Path: "settings", Function: PluginRenewManagerUpdateSettings},
+			{Method: http.MethodGet, Path: "list", Function: PluginRenewManagerGetList},
+			{Method: http.MethodPatch, Path: "list", Function: PluginRenewManagerAddAccount},
+			{Method: http.MethodDelete, Path: "list/:id", Function: PluginRenewManagerDelAccount},
+			{Method: http.MethodPost, Path: "list/empty", Function: PluginRenewManagerDelAllAccounts},
+			{Method: http.MethodGet, Path: "check/:pid/status/:fname", Function: PluginRenewManagerPreCheckStatus},
+		},
+	},
+})
+
+// var managerTasksPageLink = []byte{104, 116, 116, 112, 115, 58, 47, 47, 116, 105, 101, 98, 97, 46, 98, 97, 105, 100, 117, 46, 99, 111, 109, 47, 109, 111, 47, 113, 47, 98, 97, 119, 117, 47, 116, 97, 115, 107, 105, 110, 102, 111, 118, 105, 101, 119, 63, 116, 98, 105, 111, 115, 119, 107, 61, 49, 38, 102, 105, 100, 61}
+
+var lastBreakDay = 0
+
+func (pluginInfo *RenewManagerType) Action() {
+	if !pluginInfo.PluginInfo.CheckActive() {
+		return
+	}
+	defer pluginInfo.PluginInfo.SetActive(false)
+
+	now := time.Now()
+	d := now.Day()
+
+	// 2:00 开始重置
+	if now.Hour() == 2 && now.Minute() < 30 {
+		if d != lastBreakDay {
+			slog.Info("renew_manager.action.skip", "time", "2:00~2:30", "date", d)
+			lastBreakDay = d
+		}
+
+		return
+	}
+
+	batchMode := _function.GetOption("go_plugin_batch_tasks") == "1"
+	id, err := strconv.ParseInt(_function.GetOption("kd_renew_manager_id"), 10, 64)
+	if err != nil {
+		id = 0
+	}
+
+	otime := now.Add(time.Hour * -24).Unix()
+
+	limit := _function.GetOption("kd_renew_manager_action_limit")
+	numLimit, _ := strconv.ParseInt(limit, 10, 64)
+	var localRenewList []*model.TcKdRenewManager
+	subQuery := _function.GormDB.R.Model(&model.TcUsersOption{}).Select("uid").Where("name = 'kd_renew_manager_open' AND value = '1'")
+
+	if batchMode {
+		BatchPluginQuery(_function.GormDB.R.Model(&model.TcKdRenewManager{}).Where("date < ? AND uid IN (?)", otime, subQuery), int(numLimit), 3, []string{"*"}, &localRenewList)
+	} else {
+		_function.GormDB.R.Model(&model.TcKdRenewManager{}).Where("id > ? AND date < ? AND uid IN (?)", id, otime, subQuery).Order("id ASC").Limit(int(numLimit)).Find(&localRenewList)
+	}
+
+	userDurationMap := map[int32]time.Duration{}
+
+	for _, renewItem := range localRenewList {
+		userDuration, ok := userDurationMap[renewItem.UID]
+		if !ok {
+			strInterval := _function.GetUserOption("kd_renew_manager_interval", strconv.Itoa(int(renewItem.UID)))
+			interval, _ := strconv.ParseInt(strInterval, 10, 64)
+			userDuration = time.Hour * 24 * time.Duration(utils.Clamp(interval, 1, 29))
+			userDurationMap[renewItem.UID] = userDuration
+		}
+
+		if now.Before(time.Unix(int64(renewItem.Date), 0).Add(userDuration)) {
+			continue
+		}
+
+		tmpLog := []string{}
+
+		cookie := _function.GetCookie(renewItem.Pid)
+
+		if !cookie.IsLogin {
+			renewItem.Status = "未登录"
+			tmpLog = append(tmpLog, "sync: failed", "cancel_top: failed")
+			slog.Error("renew_manager.action.login", "uid", renewItem.UID, "pid", renewItem.Pid, "fid", renewItem.Fid, "fname", renewItem.Fname)
+		} else {
+			// sync tasks
+			// endtime 不是实时更新的，每天 2:00 开始，根据未知的排列顺序进队列重置，2:00 开始每隔 1 秒请求一次，到重置时会因为锁表而卡住
+			// 新的 endtime 是重置当天 0:00 开始计算的 29天23小时59分钟59秒 后
+			// bawutask 是实时更新，只要完成 taskstatus 就是 1，重置 endtime 时同时重置 bawutask
+
+			todayDone := false
+
+			res2, err := _function.GetManagerTasks(cookie, int64(renewItem.Fid))
+			if err != nil {
+				slog.Error("renew_manager.action.sync_tasks", "error", err)
+				tmpLog = append(tmpLog, "sync: failed")
+			} else {
+				if res2.No != 0 {
+					slog.Error("renew_manager.action.sync_tasks", "code", res2.ErrCode, "error", res2.Error)
+					tmpLog = append(tmpLog, fmt.Sprintf("sync: %d#%s", res2.ErrCode, res2.Error))
+				} else {
+					tmpLog = append(tmpLog, "sync: done")
+
+					remoteEnd := int32(res2.Data.BawuTask.EndTime)
+
+					for _, remoteTask := range res2.Data.BawuTask.TaskList {
+						if remoteTask.TaskStatus == "1" {
+							todayDone = true
+							break
+						}
+					}
+
+					if todayDone {
+						// 由于重置有延迟，这里极小概率会有 1 天的误差
+						// 2:00~2:30 不运行以尽量规避误差
+						today2clock := time.Date(now.Year(), now.Month(), now.Day(), 2, 0, 0, 0, now.Location())
+						if now.Before(today2clock) {
+							// today 0:00
+							today2clock = today2clock.Add(-time.Hour * 2)
+						} else {
+							// next 0:00, not 2:00
+							today2clock = today2clock.Add(time.Hour * 22)
+						}
+						remoteEnd = int32(today2clock.Add(time.Hour*24*30 - time.Second).Unix())
+					}
+
+					if renewItem.End < remoteEnd {
+						renewItem.End = remoteEnd
+
+						if renewItem.Date > 0 && todayDone {
+							renewItem.Date = int32(now.Unix())
+						} else {
+							// new Date // value of Date should not exceed now
+							var toHms time.Time
+							if renewItem.Date > 0 {
+								toHms = time.Unix(int64(renewItem.Date), 0)
+							} else {
+								toHms = now
+							}
+
+							remoteLastTaskDate := time.Unix(int64(renewItem.End), 0).Add(-time.Hour * 24 * 30)
+							renewItem.Date = int32(min(time.Date(remoteLastTaskDate.Year(), remoteLastTaskDate.Month(), remoteLastTaskDate.Day(), toHms.Hour(), toHms.Minute(), toHms.Second(), 0, now.Location()).Unix(), now.Unix()))
+						}
+					} else if renewItem.Date == 0 && todayDone {
+						renewItem.Date = int32(now.Unix())
+					}
+				}
+			}
+
+			if !todayDone && !now.Before(time.Unix(int64(renewItem.Date), 0).Add(userDuration)) {
+				// send cancel top package
+				res, err := PluginRenewManagerCancelTop(cookie, renewItem.Fname, renewItem.Tid)
+
+				if err != nil {
+					slog.Error("renew_manager.action.cancel_top", "response", res, "error", err)
+					renewItem.Status = "失败"
+					tmpLog = append(tmpLog, "cancel_top: failed")
+				} else {
+					if res.No != 0 {
+						slog.Error("renew_manager.action.cancel_top", "code", res.ErrCode, "error", res.Error)
+						renewItem.Status = "失败"
+						tmpLog = append(tmpLog, fmt.Sprintf("cancel_top: %d#%s", res.ErrCode, res.Error))
+					} else {
+						renewItem.Status = "成功"
+						tmpLog = append(tmpLog, "cancel_top: done")
+					}
+				}
+
+				// new Date
+				renewItem.Date = int32(now.Unix())
+			} else {
+				renewItem.Status = "成功"
+				tmpLog = append(tmpLog, "cancel_top: skip")
+			}
+		}
+
+		// previous logs
+		previousLogs := []string{}
+		for i, s := range strings.Split(renewItem.Log, "<br />") {
+			if i <= 30 {
+				previousLogs = append(previousLogs, s)
+			} else {
+				break
+			}
+		}
+		renewItem.Log = fmt.Sprintf("%s: %s<br />%s", now.Format(time.DateOnly), strings.Join(tmpLog, ", "), strings.Join(previousLogs, "<br />"))
+
+		_function.GormDB.W.Model(&model.TcKdRenewManager{}).Where("id = ?", renewItem.ID).Updates(renewItem)
+		if !batchMode {
+			_function.SetOption("kd_renew_manager_id", strconv.Itoa(int(renewItem.ID)))
+		}
+	}
+	if !batchMode {
+		_function.SetOption("kd_renew_manager_id", "0")
+	}
+	// clean
+
+}
+
+func (pluginInfo *RenewManagerType) Install() error {
+	for k, v := range pluginInfo.Options {
+		_function.SetOption(k, v)
+	}
+	UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, false, "")
+
+	return _function.GormDB.W.Migrator().CreateTable(&model.TcKdRenewManager{})
+}
+
+func (pluginInfo *RenewManagerType) Delete() error {
+	for k := range pluginInfo.Options {
+		_function.DeleteOption(k)
+	}
+	DeletePluginInfo(pluginInfo.Name)
+
+	_function.GormDB.W.Migrator().DropTable(&model.TcKdRenewManager{})
+
+	// user options
+	_function.GormDB.W.Where("name = ?", "kd_renew_manager_open").Delete(&model.TcUsersOption{})
+	_function.GormDB.W.Where("name = ?", "kd_renew_manager_alert").Delete(&model.TcUsersOption{})
+	_function.GormDB.W.Where("name = ?", "kd_renew_manager_interval").Delete(&model.TcUsersOption{})
+
+	return nil
+}
+func (pluginInfo *RenewManagerType) Upgrade() error {
+	return nil
+}
+
+func (pluginInfo *RenewManagerType) RemoveAccount(_type string, id int32, tx *gorm.DB) error {
+	_sql := _function.GormDB.W
+	if tx != nil {
+		_sql = tx
+	}
+	return _sql.Where(_type+" = ?", id).Delete(&model.TcKdRenewManager{}).Error
+}
+
+func (pluginInfo *RenewManagerType) Report(uid int32, tx *gorm.DB) (string, error) {
+	if uid <= 0 {
+		return "", errors.New("invalid uid")
+	}
+
+	isActive := _function.GetUserOption("kd_renew_manager_alert", strconv.Itoa(int(uid)))
+
+	if isActive == "0" || isActive == "" {
+		return "", nil
+	}
+
+	interval := _function.GetUserOption("kd_renew_manager_interval", strconv.Itoa(int(uid)))
+
+	numInterval, _ := strconv.ParseInt(interval, 10, 64)
+
+	if numInterval <= 0 {
+		numInterval = 1
+	}
+
+	renewStatus := []*model.TcKdRenewManager{}
+	if err := _function.GormDB.W.Model(&model.TcKdRenewManager{}).Where("uid = ?", uid).Find(&renewStatus).Error; err != nil {
+		return "", err
+	}
+
+	var message strings.Builder
+	message.WriteString("---\n插件：" + pluginInfo.PluginNameCN + "\n\n")
+
+	for _, status := range renewStatus {
+		// - xxx吧 (fid:12121121) @yyyyy [ LATEST:01-01/NEXT:01-03/END:02-01 ]
+		message.WriteString(fmt.Sprintf("- %s吧 (fid:%d) @%s [ %s/%s/%s ]\n", status.Fname, status.Fid, _function.GetCookie(status.Pid, true).Name, time.Unix(int64(status.Date), 0).Format("01-02"), time.Unix(int64(status.Date), 0).Add(time.Hour*24*time.Duration(numInterval)).Format("01-02"), time.Unix(int64(status.End), 0).Format("01-02")))
+	}
+
+	message.WriteString("\n格式说明：[ 上次执行/下次检查/截止日期 ]\n---")
+
+	return message.String(), nil
+}
+
+func (pluginInfo *RenewManagerType) Reset(uid, pid, tid int32) error {
+	if uid == 0 {
+		return errors.New("invalid uid")
+	}
+
+	_sql := _function.GormDB.W.Model(&model.TcKdRenewManager{}).Where("uid = ?", uid)
+	if pid != 0 {
+		_sql = _sql.Where("pid = ?", pid)
+	}
+
+	if tid != 0 {
+		_sql = _sql.Where("id = ?", tid)
+	}
+
+	return _sql.Update("date", 0).Error
+}
+
+func (pluginInfo *RenewManagerType) ExportAccount(uid int32, tx *gorm.DB) (map[string]any, error) {
+	if !pluginInfo.GetSwitch() {
+		return nil, nil
+	}
+
+	tableName := (&model.TcKdRenewManager{}).TableName()
+	var exportData []*model.TcKdRenewManager
+
+	if tx == nil {
+		tx = _function.GormDB.R
+	}
+
+	err := tx.Model(&model.TcKdRenewManager{}).Where("uid = ?", uid).Find(&exportData).Error
+
+	return map[string]any{
+		tableName: exportData,
+		"tc_users_options": _function.GetUserOptionBatch(strconv.Itoa(int(uid)), _function.OptionExt{
+			Tx:      tx,
+			KeyName: "kd_renew_manager_alert",
+		}, _function.OptionExt{
+			Tx:      tx,
+			KeyName: "kd_renew_manager_interval",
+		}, _function.OptionExt{
+			Tx:      tx,
+			KeyName: "kd_renew_manager_open",
+		}),
+	}, err
+}
+
+func (pluginInfo *RenewManagerType) ImportAccount(uid int32, pid map[int32]int32, data map[string]json.RawMessage, tx *gorm.DB) error {
+	if !pluginInfo.GetSwitch() {
+		return errors.New("plugin is not enabled")
+	}
+
+	if tx == nil {
+		tx = _function.GormDB.W
+	}
+
+	tableName := (&model.TcKdRenewManager{}).TableName()
+
+	var data2 []*model.TcKdRenewManager
+	if err := _function.JsonDecode(data[tableName], &data2); err != nil {
+		return errors.New("invalid data format")
+	}
+
+	var data3 []*model.TcKdRenewManager
+
+	for i := range data2 {
+		if pid, ok := pid[data2[i].Pid]; ok {
+			data2[i].Pid = pid
+			data2[i].ID = 0
+			data2[i].UID = uid
+			data3 = append(data3, data2[i])
+		}
+	}
+
+	if len(data3) == 0 {
+		return nil
+	}
+
+	return tx.Model(&model.TcKdRenewManager{}).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "pid"}, {Name: "fid"}},
+		DoNothing: true,
+	}).Create(data3).Error
+}
+
+// func _PluginRenewManagerAlertMessage(name, fname, end string, fid int32) _function.PushMessageTemplateStruct {
+// 	return _function.PushMessageTemplateStruct{
+// 		Title: fmt.Sprintf("吧主考核提醒 - %s吧", fname),
+// 		Body:  fmt.Sprintf("@%s 您的吧主账号在 %s吧 (fid:%d) 的考核任务将于 %s 截止，目前剩余不到 15 天。<br /><br />由于 TbSign 已超过 15 天 未能完成考核，请您尽快前往 [吧主考核页面](%s%d) 完成相关任务。", name, fname, fid, end, managerTasksPageLink, fid),
+// 	}
+// }
+
+type PluginRenewManagerCancelTopResponse struct {
+	No      int `json:"no,omitempty"`
+	ErrCode int `json:"err_code,omitempty"`
+	Error   any `json:"error,omitempty"`
+	// Data    struct {
+	// 	SecondClassID string `json:"second_class_id,omitempty"`
+	// 	AutoMsg       string `json:"autoMsg,omitempty"`
+	// 	Fid           int    `json:"fid,omitempty"`
+	// 	Fname         string `json:"fname,omitempty"`
+	// 	Tid           int64  `json:"tid,omitempty"`
+	// 	IsLogin       int    `json:"is_login,omitempty"`
+	// 	Content       string `json:"content,omitempty"`
+	// 	AccessState   any    `json:"access_state,omitempty"`
+	// 	Experience    int    `json:"experience,omitempty"`
+	// 	IsPopAward    int    `json:"is_pop_award,omitempty"`
+	// 	PopURL        string `json:"pop_url,omitempty"`
+	// 	Vcode         struct {
+	// 		NeedVcode       int    `json:"need_vcode,omitempty"`
+	// 		StrReason       string `json:"str_reason,omitempty"`
+	// 		CaptchaVcodeStr string `json:"captcha_vcode_str,omitempty"`
+	// 		CaptchaCodeType int    `json:"captcha_code_type,omitempty"`
+	// 		Userstatevcode  int    `json:"userstatevcode,omitempty"`
+	// 	} `json:"vcode,omitempty"`
+	// } `json:"data,omitempty"`
+}
+
+func PluginRenewManagerCancelTop(cookie *_type.TypeCookie, fname string, tid string) (*PluginRenewManagerCancelTopResponse, error) {
+	headersMap := map[string]string{
+		"Cookie":       "BDUSS=" + cookie.Bduss + ";STOKEN=" + cookie.Stoken,
+		"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+		"Referrer":     "https://tieba.baidu.com/p/" + tid,
+	}
+
+	body := url.Values{
+		"ie":  {"utf-8"},
+		"tbs": {cookie.Tbs},
+		"kw":  {fname},
+		"fid": {strconv.Itoa(int(_function.GetFid(fname)))},
+		"tid": {tid},
+	}
+
+	res, err := _function.TBFetch("https://tieba.baidu.com/f/commit/thread/top/cancel", http.MethodPost, []byte(body.Encode()), headersMap)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// slog.Debug("renew_manager.cancel_top", "response", string(res))
+
+	resp := new(PluginRenewManagerCancelTopResponse)
+
+	err = _function.JsonDecode(res, resp)
+
+	return resp, err
+}
+
+// b64.Ly8gaHR0cHM6Ly90aWViYS5iYWlkdS5jb20vYy9jL2Jhd3UvY29tbWl0dG9wX3BjCi8vIHdvcmQ9PGZuYW1lPiZudG49Jno9PHRpZD4mZmlkPTxmaWQ+JmNpZD0wJnRicz08dGJzPiZzdWJhcHBfdHlwZT1wYyZfY2xpZW50X3R5cGU9MjAmc2lnbj08c2lnbj4KCi8vIGh0dHBzOi8vdGllYmEuYmFpZHUuY29tL2MvYy9iYXd1L2NvbW1pdGdvb2RfcGMKLy8gd29yZD08Zm5hbWU+JmZpZD08ZmlkPiZ6PTx0aWQ+Jm50bj0mY2lkPTAmdGJzPTx0YnM+JnN1YmFwcF90eXBlPXBjJl9jbGllbnRfdHlwZT0yMCZzaWduPTxzaWduPgoKLy8gaHR0cHM6Ly90aWViYS5iYWlkdS5jb20vYy9jL2Jhd3UvZGVsdGhyZWFkX3BjCi8vIGJhd3VfZGVsX3JlYXNvbl9pbmZvPTxyZWFzb24+JndvcmQ9PGZuYW1lPiZ6PTx0aWQ+JmZpZD08ZmlkPiZ0YnM9PHRicz4mc3ViYXBwX3R5cGU9cGMmX2NsaWVudF90eXBlPTIwJnNpZ249PHNpZ24+
+
+type PluginRenewManagerGetThreadInfoResponse struct {
+	No    int    `json:"no,omitempty"`
+	Error string `json:"error,omitempty"`
+	Data  struct {
+		Forum struct {
+			// ForumHelper struct {
+			// 	Name      string `json:"name,omitempty"`
+			// 	AvatarURL string `json:"avatar_url,omitempty"`
+			// } `json:"forum_helper,omitempty"`
+			// ForumAvatar string `json:"forum_avatar,omitempty"`
+			ForumName string `json:"forum_name,omitempty"`
+		} `json:"forum,omitempty"`
+		ThreadInfo struct {
+			ThreadID int64 `json:"thread_id,omitempty"`
+			// PostID          int64  `json:"post_id,omitempty"`
+			Title string `json:"title,omitempty"`
+			// Content         string `json:"content,omitempty"`
+			// PostCate        int    `json:"post_cate,omitempty"`
+			// PostTag         int    `json:"post_tag,omitempty"`
+			PostCreateTime string `json:"post_create_time,omitempty"`
+			// PostLocation    string `json:"post_location,omitempty"`
+			// ShowPostContent string `json:"show_post_content,omitempty"`
+			// PassPostContent string `json:"pass_post_content,omitempty"`
+			// ContentDetail   []struct {
+			// 	Type  int    `json:"type,omitempty"`
+			// 	Value string `json:"value,omitempty"`
+			// } `json:"content_detail,omitempty"`
+			// AllPics      []any `json:"all_pics,omitempty"`
+			// IsFrsMask    int   `json:"is_frs_mask,omitempty"`
+			// CommentNum   int   `json:"comment_num,omitempty"`
+			// ReadNum      int   `json:"read_num,omitempty"`
+			// AgreeNum     int   `json:"agree_num,omitempty"`
+			// ShareNum     int   `json:"share_num,omitempty"`
+			// DisagreeNum  int   `json:"disagree_num,omitempty"`
+			// ShareUserNum int   `json:"share_user_num,omitempty"`
+			// CollectNum   int   `json:"collect_num,omitempty"`
+		} `json:"thread_info,omitempty"`
+		// Tbs      string `json:"tbs,omitempty"`
+		UserInfo struct {
+			UserName     string `json:"user_name,omitempty"`
+			UserNick     string `json:"user_nick,omitempty"`
+			ShowNickname string `json:"show_nickname,omitempty"`
+			Portrait     string `json:"portrait,omitempty"`
+		} `json:"user_info,omitempty"`
+	} `json:"data,omitempty"`
+}
+
+var managerGetThreadInfoLink = string([]byte{104, 116, 116, 112, 115, 58, 47, 47, 116, 105, 101, 98, 97, 46, 98, 97, 105, 100, 117, 46, 99, 111, 109, 47, 109, 111, 47, 113, 47, 98, 97, 119, 117, 47, 103, 101, 116, 82, 101, 99, 111, 118, 101, 114, 73, 110, 102, 111, 63})
+
+func PluginRenewManagerGetThreadInfo(cookie *_type.TypeCookie, tid int64, fid int64) (*PluginRenewManagerGetThreadInfoResponse, error) {
+	headersMap := map[string]string{
+		"Cookie": "BDUSS=" + cookie.Bduss + ";STOKEN=" + cookie.Stoken,
+	}
+
+	query := url.Values{}
+	query.Set("thread_id", strconv.Itoa(int(tid)))
+	query.Set("forum_id", strconv.Itoa(int(fid)))
+	query.Set("type", "1")
+	query.Set("sub_type", "1")
+	query.Set("tbs", cookie.Tbs)
+
+	res, err := _function.TBFetch(managerGetThreadInfoLink+query.Encode(), http.MethodGet, nil, headersMap)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// slog.Debug("renew_manager.get_thread_info", "response", string(res))
+
+	resp := new(PluginRenewManagerGetThreadInfoResponse)
+
+	err = _function.JsonDecode(res, resp)
+
+	return resp, err
+}
+
+// endpoint
+func PluginRenewManagerGetSwitch(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	status := _function.GetUserOption("kd_renew_manager_open", uid)
+	if status == "" {
+		status = "0"
+		_function.SetUserOption("kd_renew_manager_open", status, uid)
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", status != "0", "tbsign"))
+}
+
+func PluginRenewManagerSwitch(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	status := _function.GetUserOption("kd_renew_manager_open", uid) != "0"
+
+	err := _function.SetUserOption("kd_renew_manager_open", !status, uid)
+
+	if err != nil {
+		slog.Debug("plugin.renew-manager.switch", "uid", uid, "current_status", status, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法启用吧主考核功能", status, "tbsign"))
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", !status, "tbsign"))
+}
+
+type PluginRenewManagerUpdateSettingsResponseStruct struct {
+	ReportSwitch   bool `json:"report_switch"`
+	ActionInterval int  `json:"action_interval"`
+}
+
+func PluginRenewManagerGetSettings(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	status := _function.GetUserOption("kd_renew_manager_alert", uid)
+	if status == "" {
+		status = "0"
+		_function.SetUserOption("kd_renew_manager_alert", status, uid)
+	}
+	interval := _function.GetUserOption("kd_renew_manager_interval", uid)
+	numInterval, _ := strconv.ParseInt(interval, 10, 64)
+	if numInterval == 0 {
+		numInterval = 1 // day
+		_function.SetUserOption("kd_renew_manager_interval", int(numInterval), uid)
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", PluginRenewManagerUpdateSettingsResponseStruct{
+		ReportSwitch:   status != "0",
+		ActionInterval: int(numInterval),
+	}, "tbsign"))
+}
+
+func PluginRenewManagerUpdateSettings(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	reportStatus := c.FormValue("report_switch") != "0" && c.FormValue("report_switch") != ""
+	interval, _ := strconv.ParseInt(strings.TrimSpace(c.FormValue("action_interval")), 10, 64)
+
+	interval = utils.Clamp(interval, 1, 29)
+
+	err := _function.GormDB.W.Transaction(func(tx *gorm.DB) error {
+		if err := _function.SetUserOption("kd_renew_manager_alert", reportStatus, uid, _function.OptionExt{
+			Tx: tx,
+		}); err != nil {
+			return err
+		}
+		if err := _function.SetUserOption("kd_renew_manager_interval", int(interval), uid, _function.OptionExt{
+			Tx: tx,
+		}); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		slog.Error("plugin.renew-manager.update_settings", "uid", uid, "report_status", reportStatus, "action_interval", interval, "error", err)
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "设置保存失败", PluginRenewManagerUpdateSettingsResponseStruct{}, "tbsign"))
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", PluginRenewManagerUpdateSettingsResponseStruct{
+		ReportSwitch:   reportStatus,
+		ActionInterval: int(interval),
+	}, "tbsign"))
+}
+
+func PluginRenewManagerGetList(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	var list []*model.TcKdRenewManager
+	_function.GormDB.R.Model(&model.TcKdRenewManager{}).Where("uid = ?", uid).Order("id ASC").Find(&list)
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", list, "tbsign"))
+}
+
+func PluginRenewManagerAddAccount(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	numUID, _ := strconv.ParseInt(uid, 10, 64)
+	pid := strings.TrimSpace(c.FormValue("pid"))
+	fname := strings.TrimSpace(c.FormValue("fname"))
+	tid := strings.TrimSpace(c.FormValue("tid"))
+
+	numPid, err := strconv.ParseInt(pid, 10, 64)
+
+	if err != nil {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效 pid", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	numTid, err := strconv.ParseInt(tid, 10, 64)
+
+	if err != nil {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效 tid", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// pre check
+	var accountInfo model.TcBaiduid
+	_function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", pid, uid).Take(&accountInfo)
+	if accountInfo.Portrait == "" {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "无效 pid", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// fid
+	fid := _function.GetFid(fname)
+	if fid == 0 {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "贴吧不存在", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	var existsList []*model.TcKdRenewManager
+	_function.GormDB.R.Model(&model.TcKdRenewManager{}).Where("uid = ? AND pid = ? AND fid = ?", uid, pid, fid).Limit(1).Find(&existsList)
+	if len(existsList) > 0 {
+		return c.JSON(http.StatusBadRequest, _function.ApiTemplate(400, "重复任务", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// is manager? && end time
+	managerTaskStatus, err := _function.GetManagerTasks(_function.GetCookie(int32(numPid)), fid)
+	if err != nil || managerTaskStatus.No != 0 {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无效用户", _function.EchoEmptyObject, "tbsign"))
+	}
+	end := managerTaskStatus.Data.BawuTask.EndTime
+
+	// TODO tid exists?
+
+	err = _function.GormDB.W.Create(&model.TcKdRenewManager{
+		Pid:    int32(numPid),
+		UID:    int32(numUID),
+		Fname:  fname,
+		Fid:    int32(fid),
+		Tid:    strconv.Itoa(int(numTid)),
+		Status: "idle",
+		Date:   0,
+		End:    int32(end),
+		Log:    "",
+	}).Error
+
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "添加失败", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	var renewerTasks []*model.TcKdRenewManager
+	_function.GormDB.R.Model(&model.TcKdRenewManager{}).Where("uid = ? AND pid = ? AND fid = ?", uid, numPid, fid).Find(&renewerTasks)
+
+	if len(renewerTasks) == 1 {
+		return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", (renewerTasks)[0], "tbsign"))
+	} else {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "查询出错", _function.EchoEmptyObject, "tbsign"))
+	}
+}
+
+func PluginRenewManagerDelAccount(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	id := c.Param("id")
+
+	numUID, _ := strconv.ParseInt(uid, 10, 64)
+	numID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无效 id", map[string]any{
+			"success": false,
+			"id":      id,
+		}, "tbsign"))
+	}
+
+	_function.GormDB.W.Model(&model.TcKdRenewManager{}).Delete(&model.TcKdRenewManager{
+		UID: int32(numUID),
+		ID:  int32(numID),
+	})
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{
+		"success": true,
+		"id":      id,
+	}, "tbsign"))
+}
+
+func PluginRenewManagerDelAllAccounts(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	numUID, _ := strconv.ParseInt(uid, 10, 64)
+
+	_function.GormDB.W.Model(&model.TcKdRenewManager{}).Delete(&model.TcKdRenewManager{
+		UID: int32(numUID),
+	})
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", true, "tbsign"))
+}
+
+func PluginRenewManagerPreCheckStatus(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	pid := c.Param("pid")
+	fname := c.Param("fname")
+
+	// pre-check pid
+	var pidCheck []*model.TcBaiduid
+	_function.GormDB.R.Where("id = ? AND uid = ?", pid, uid).Limit(1).Find(&pidCheck)
+
+	if len(pidCheck) == 0 {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效 pid", _type.BawuTask{}, "tbsign"))
+	}
+
+	fid := _function.GetFid(fname)
+	if fid == 0 {
+		return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", _type.BawuTask{}, "tbsign"))
+	}
+	resp, err := _function.GetManagerTasks(_function.GetCookie(pidCheck[0].ID), fid)
+	if err != nil {
+		slog.Error("plugin.renew-manager.pre_check_status", "uid", uid, "pid", pid, "fname", fname, "error", err)
+	}
+
+	if err != nil || resp.No != 0 {
+
+		// TODO not a good idea
+		errStr := resp.Error
+		if errStr == "" {
+			errStr = "未知错误"
+		}
+
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, errStr, _type.BawuTask{}, "tbsign"))
+	} else {
+		return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", resp.Data.BawuTask, "tbsign"))
+	}
+}

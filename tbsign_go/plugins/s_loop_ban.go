@@ -1,0 +1,755 @@
+package _plugin
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	_function "github.com/BANKA2017/tbsign_go/functions"
+	"github.com/BANKA2017/tbsign_go/model"
+	_type "github.com/BANKA2017/tbsign_go/types"
+	"github.com/labstack/echo/v4"
+	"golang.org/x/exp/slices"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+func init() {
+	PluginList.Register(LoopBanPlugin)
+}
+
+type BanAccountResponse struct {
+	Un         string `json:"un,omitempty"`
+	ServerTime string `json:"server_time,omitempty"`
+	Time       int    `json:"time,omitempty"`
+	Ctime      int    `json:"ctime,omitempty"`
+	Logid      int    `json:"logid,omitempty"`
+	ErrorCode  string `json:"error_code,omitempty"`
+	ErrorMsg   string `json:"error_msg,omitempty"`
+	Info       []any  `json:"info,omitempty"`
+}
+
+type LoopBanPluginType struct {
+	PluginInfo
+}
+
+var LoopBanPlugin = _function.VPtr(LoopBanPluginType{
+	PluginInfo{
+		Name:              "ver4_ban",
+		PluginNameCN:      "循环封禁",
+		PluginNameCNShort: "循环封禁",
+		PluginNameFE:      "loop_ban",
+		Version:           "1.4",
+		Options: map[string]string{
+			"ver4_ban_break_check":  "0",
+			"ver4_ban_id":           "0",
+			"ver4_ban_limit":        "5",
+			"ver4_ban_action_limit": "50",
+		},
+		SettingOptions: map[string]PluginSettingOption{
+			"ver4_ban_break_check": {
+				OptionName:   "ver4_ban_break_check",
+				OptionNameCN: "跳过吧务权限检查",
+				Validate: &_function.OptionRule{
+					Enum: []string{"0", "1"},
+				},
+			},
+			"ver4_ban_limit": {
+				OptionName:   "ver4_ban_limit",
+				OptionNameCN: "可添加循环封禁账号上限",
+				Validate: &_function.OptionRule{
+					Min: _function.VPtr(int64(0)),
+				},
+			},
+			"ver4_ban_action_limit": {
+				OptionName:   "ver4_ban_action_limit",
+				OptionNameCN: "每分钟最大执行数",
+				Validate: &_function.OptionRule{
+					Min: _function.VPtr(int64(0)),
+				},
+			},
+		},
+		Endpoints: []PluginEndpointStruct{
+			{Method: http.MethodGet, Path: "switch", Function: PluginLoopBanGetSwitch},
+			{Method: http.MethodPost, Path: "switch", Function: PluginLoopBanSwitch},
+			{Method: http.MethodGet, Path: "reason", Function: PluginLoopBanGetReason},
+			{Method: http.MethodPut, Path: "reason", Function: PluginLoopBanSetReason},
+			{Method: http.MethodGet, Path: "list", Function: PluginLoopBanGetList},
+			{Method: http.MethodPatch, Path: "list", Function: PluginLoopBanAddAccounts},
+			{Method: http.MethodDelete, Path: "list/:id", Function: PluginLoopBanDelAccount},
+			{Method: http.MethodPost, Path: "list/empty", Function: PluginLoopBanDelAllAccounts},
+		},
+	},
+})
+
+var banDays = []int32{1, 3, 10}
+
+func PostClientBan(cookie *_type.TypeCookie, fid int32, portrait string, day int32, reason string) (*BanAccountResponse, error) {
+	isSvipBlock := "0"
+	if day <= 90 && !slices.Contains(banDays, day) {
+		isSvipBlock = "1"
+	}
+
+	var form = map[string]string{
+		"BDUSS":       cookie.Bduss,
+		"day":         strconv.Itoa(int(day)),
+		"fid":         strconv.Itoa(int(fid)),
+		"is_loop_ban": isSvipBlock, // <- Users have to check their svip status in advance
+		"ntn":         "banid",
+		"portrait":    portrait,
+		"reason":      reason,
+		"tbs":         cookie.Tbs,
+		"word":        "-",
+		"z":           "6",
+	}
+
+	_function.ClientTypeFallBack(form, "android")
+	_function.AddSign(form, "android")
+	_body := url.Values{}
+	for k, v := range form {
+		if k != "sign" {
+			_body.Set(k, v)
+		}
+	}
+	banResponse, err := _function.TBFetch("https://tiebac.baidu.com/c/c/bawu/commitprison", http.MethodPost, []byte(_body.Encode()+"&sign="+form["sign"]), _function.EmptyHeaders)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var banDecode BanAccountResponse
+	err = _function.JsonDecode(banResponse, &banDecode)
+	return &banDecode, err
+}
+
+func PostNewPCBan(cookie *_type.TypeCookie, fid int32, portrait string, day int32, reason string) (*any, error) {
+	// isSvipBlock := "0"
+	banDaysIndex := 0
+	if ndi := slices.Index(banDays, day); ndi != -1 {
+		// isSvipBlock = "1"
+		banDaysIndex = ndi
+	}
+
+	var form = map[string]string{
+		"BDUSS": cookie.Bduss,
+		"day":   strconv.Itoa(banDaysIndex),
+		"fid":   strconv.Itoa(int(fid)),
+		// "is_loop_ban": isSvipBlock, // <- Not yet known how to set loop ban from new pc client
+		"ntn":      "banid",
+		"portrait": portrait,
+		"reason":   reason,
+		"tbs":      cookie.Tbs,
+		"word":     "-", //fname
+		"z":        "6", //tid
+
+		"post_id":     "0",
+		"un":          "",
+		"subapp_type": "pc",
+	}
+	_function.AddSign(form, "pc")
+	_body := url.Values{}
+	for k, v := range form {
+		if k != "sign" {
+			_body.Set(k, v)
+		}
+	}
+	banResponse, err := _function.TBFetch("https://tieba.baidu.com/c/c/bawu/commitprison_pc", http.MethodPost, []byte(_body.Encode()+"&sign="+form["sign"]), _function.EmptyHeaders)
+
+	if err != nil {
+		return nil, err
+	}
+
+	var banDecode any
+	err = _function.JsonDecode(banResponse, &banDecode)
+	return &banDecode, err
+}
+
+func (pluginInfo *LoopBanPluginType) Action() {
+	if !pluginInfo.PluginInfo.CheckActive() {
+		return
+	}
+	defer pluginInfo.PluginInfo.SetActive(false)
+
+	batchMode := _function.GetOption("go_plugin_batch_tasks") == "1"
+	id, err := strconv.ParseInt(_function.GetOption("ver4_ban_id"), 10, 64)
+	if err != nil {
+		id = 0
+	}
+	otime := time.Now().Add(time.Hour * -24).Unix()
+	var localBanAccountList []*model.TcVer4BanList
+	subQuery := _function.GormDB.R.Model(&model.TcUsersOption{}).Select("uid").Where("name = 'ver4_ban_open' AND value = '1'")
+
+	limit := _function.GetOption("ver4_ban_action_limit")
+	numLimit, _ := strconv.ParseInt(limit, 10, 64)
+	if batchMode {
+		BatchPluginQuery(_function.GormDB.R.Model(&model.TcVer4BanList{}).Where("date < ? AND stime < ? AND etime > ? AND uid IN (?)", otime, time.Now().Unix(), time.Now().Unix(), subQuery), int(numLimit), 3, []string{"*"}, &localBanAccountList)
+	} else {
+		_function.GormDB.R.Model(&model.TcVer4BanList{}).Where("id > ? AND date < ? AND stime < ? AND etime > ? AND uid IN (?)", id, otime, time.Now().Unix(), time.Now().Unix(), subQuery).Order("id ASC").Limit(int(numLimit)).Find(&localBanAccountList)
+	}
+
+	var reasonList []*model.TcVer4BanUserset
+	_function.GormDB.R.Model(&model.TcVer4BanUserset{}).Find(&reasonList)
+
+	for _, banAccountInfo := range localBanAccountList {
+		// find reason
+		var reason = "您因为违反吧规，已被吧务封禁，如有疑问请联系吧务！"
+		for _, reasonDB := range reasonList {
+			if reasonDB.UID == banAccountInfo.UID && reasonDB.C != "" {
+				reason = reasonDB.C
+				break
+			}
+		}
+
+		//get fid
+		fid := _function.GetFid(banAccountInfo.Tieba)
+		if fid == 0 {
+			slog.Error("forum not exists (plugin.loop-ban.get-fid)", "fname", banAccountInfo.Tieba)
+			continue
+		}
+
+		// !!! warning: unable to check permission !!!
+		cookie := _function.GetCookie(banAccountInfo.Pid)
+		msg := banAccountInfo.Log
+		if !cookie.IsLogin {
+			msg += time.Now().Format(time.DateTime) + " 执行结果：<font color=\"red\">操作失败</font>#-1 账号未登录<br>"
+		} else {
+			response, err := PostClientBan(cookie, int32(fid), banAccountInfo.Portrait, 1, reason)
+			if err != nil {
+				slog.Error("plugin.loop-ban.action", "fname", banAccountInfo.Tieba, "pid", banAccountInfo.Pid, "portrait", banAccountInfo.Portrait, "error", err)
+				continue
+			}
+
+			if response.ErrorMsg != "" {
+				msg += time.Now().Format(time.DateTime) + " 执行结果：<font color=\"red\">操作失败</font>#" + response.ErrorCode + " " + response.ErrorMsg + "<br>"
+			} else {
+				msg += time.Now().Format(time.DateTime) + " 执行结果：<font color=\"green\">操作成功</font><br>"
+			}
+		}
+
+		_function.GormDB.W.Model(&model.TcVer4BanList{}).Where("id = ?", banAccountInfo.ID).Updates(model.TcVer4BanList{
+			Log:  msg,
+			Date: int32(time.Now().Unix()),
+		})
+		if !batchMode {
+			_function.SetOption("ver4_ban_id", strconv.Itoa(int(banAccountInfo.ID)))
+		}
+	}
+	if !batchMode {
+		_function.SetOption("ver4_ban_id", "0")
+	}
+
+	// clean
+
+}
+
+func (pluginInfo *LoopBanPluginType) Install() error {
+	for k, v := range pluginInfo.Options {
+		_function.SetOption(k, v)
+	}
+	UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, false, "")
+
+	return _function.GormDB.W.Migrator().CreateTable(&model.TcVer4BanUserset{}, &model.TcVer4BanList{})
+}
+
+func (pluginInfo *LoopBanPluginType) Delete() error {
+	for k := range pluginInfo.Options {
+		_function.DeleteOption(k)
+	}
+	DeletePluginInfo(pluginInfo.Name)
+	_function.GormDB.W.Migrator().DropTable(&model.TcVer4BanUserset{}, &model.TcVer4BanList{})
+
+	// user options
+	_function.GormDB.W.Where("name = ?", "ver4_ban_open").Delete(&model.TcUsersOption{})
+
+	return nil
+}
+func (pluginInfo *LoopBanPluginType) Upgrade() error {
+	return nil
+}
+
+func (pluginInfo *LoopBanPluginType) RemoveAccount(_type string, id int32, tx *gorm.DB) error {
+	_sql := _function.GormDB.W
+	if tx != nil {
+		_sql = tx
+	}
+
+	if err := _sql.Where(_type+" = ?", id).Delete(&model.TcVer4BanList{}).Error; err != nil {
+		return err
+	}
+	if _type == "uid" {
+		return _sql.Where("uid = ?", id).Delete(&model.TcVer4BanUserset{}).Error
+	}
+	return nil
+}
+
+func (pluginInfo *LoopBanPluginType) Report(int32, *gorm.DB) (string, error) {
+	return "", nil
+}
+
+func (pluginInfo *LoopBanPluginType) Reset(uid, pid, tid int32) error {
+	if uid == 0 {
+		return errors.New("invalid uid")
+	}
+
+	_sql := _function.GormDB.W.Model(&model.TcVer4BanList{}).Where("uid = ?", uid)
+	if pid != 0 {
+		_sql = _sql.Where("pid = ?", pid)
+	}
+
+	if tid != 0 {
+		_sql = _sql.Where("id = ?", tid)
+	}
+
+	return _sql.Update("date", 0).Error
+}
+
+func (pluginInfo *LoopBanPluginType) ExportAccount(uid int32, tx *gorm.DB) (map[string]any, error) {
+	if !pluginInfo.GetSwitch() {
+		return nil, nil
+	}
+
+	// banlist
+	banListTableName := (&model.TcVer4BanList{}).TableName()
+	var banList []*model.TcVer4BanList
+
+	if tx == nil {
+		tx = _function.GormDB.R
+	}
+
+	err := tx.Model(&model.TcVer4BanList{}).Where("uid = ?", uid).Find(&banList).Error
+
+	if err != nil {
+		return nil, err
+	}
+
+	// reason
+	reasonTableName := (&model.TcVer4BanUserset{}).TableName()
+	var reason []*model.TcVer4BanUserset
+
+	if tx == nil {
+		tx = _function.GormDB.R
+	}
+
+	err = tx.Model(&model.TcVer4BanUserset{}).Where("uid = ?", uid).Find(&reason).Error
+
+	return map[string]any{
+		banListTableName: banList,
+		reasonTableName:  reason,
+		"tc_users_options": _function.GetUserOptionBatch(strconv.Itoa(int(uid)), _function.OptionExt{
+			Tx:      tx,
+			KeyName: "ver4_ban_open",
+		}),
+	}, err
+}
+
+func (pluginInfo *LoopBanPluginType) ImportAccount(uid int32, pid map[int32]int32, data map[string]json.RawMessage, tx *gorm.DB) error {
+	if !pluginInfo.GetSwitch() {
+		return errors.New("plugin is not enabled")
+	}
+
+	if tx == nil {
+		tx = _function.GormDB.W
+	}
+
+	tableName := (&model.TcVer4BanList{}).TableName()
+
+	var data2 []*model.TcVer4BanList
+	if err := _function.JsonDecode(data[tableName], &data2); err != nil {
+		return errors.New("invalid data format")
+	}
+
+	var data3 []*model.TcVer4BanList
+
+	// limit
+	numLimit, _ := strconv.Atoi(_function.GetOption("ver4_ban_limit"))
+
+	var existsAccountList []*model.TcVer4BanList
+	_function.GormDB.R.Model(&model.TcVer4BanList{}).Select("pid", "portrait", "tieba").Where("uid = ?", uid).Find(&existsAccountList)
+
+	count := len(existsAccountList)
+
+	remain := numLimit - count
+
+	for i := range data2 {
+		if pid, ok := pid[data2[i].Pid]; ok {
+			if remain <= 0 {
+				break
+			}
+
+			var exists bool
+			for _, task := range existsAccountList {
+				if task.Pid == pid && task.Portrait == data2[i].Portrait && task.Tieba == data2[i].Tieba {
+					exists = true
+					break
+				}
+			}
+
+			if !exists {
+				data2[i].Pid = pid
+				data2[i].ID = 0
+				data2[i].UID = uid
+
+				data3 = append(data3, data2[i])
+				remain--
+			}
+
+		}
+	}
+
+	if len(data3) > 0 {
+		banListErr := tx.Model(&model.TcVer4BanList{}).Create(data3).Error
+
+		if banListErr != nil {
+			return banListErr
+		}
+	}
+
+	var reason []*model.TcVer4BanUserset
+	if err := _function.JsonDecode(data[(&model.TcVer4BanUserset{}).TableName()], &reason); err != nil {
+		return errors.New("invalid data format")
+	}
+
+	if len(reason) == 0 {
+		return nil
+	}
+
+	var localReason model.TcVer4BanUserset
+	err := _function.GormDB.R.Model(&model.TcVer4BanUserset{}).Where("uid = ?", uid).Limit(1).Find(&localReason).Error
+
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return tx.Model(&model.TcVer4BanUserset{}).Create(&model.TcVer4BanUserset{
+			UID: uid,
+			C:   reason[0].C,
+		}).Error
+	} else if reason[0].C != localReason.C && localReason.C != "" {
+		return tx.Model(&model.TcVer4BanUserset{}).Where("uid = ?", uid).Update("c", reason[0].C).Error
+	}
+
+	return nil
+}
+
+// endpoint
+
+type addAccountsResponseList struct {
+	ID       int32  `json:"id"`
+	PID      int32  `json:"pid"`
+	Name     string `json:"name,omitempty"`
+	NameShow string `json:"name_show,omitempty"`
+	Portrait string `json:"portrait"`
+	Fname    string `json:"fname,omitempty"`
+	Start    int64  `json:"start,omitempty"`
+	End      int64  `json:"end,omitempty"`
+	Success  bool   `json:"success"`
+	Msg      string `json:"msg,omitempty"`
+	Log      string `json:"log,omitempty"`
+	Date     int32  `json:"date,omitempty"`
+}
+
+func PluginLoopBanGetSwitch(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	status := _function.GetUserOption("ver4_ban_open", uid)
+	if status == "" {
+		status = "0"
+		_function.SetUserOption("ver4_ban_open", status, uid)
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", status != "0", "tbsign"))
+}
+
+func PluginLoopBanSwitch(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	status := _function.GetUserOption("ver4_ban_open", uid) != "0"
+
+	err := _function.SetUserOption("ver4_ban_open", !status, uid)
+
+	if err != nil {
+		slog.Debug("plugin.loop-ban.switch", "uid", uid, "current_status", status, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法启用循环封禁功能", status, "tbsign"))
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", !status, "tbsign"))
+}
+
+func PluginLoopBanGetReason(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	var loopBanSettings []*model.TcVer4BanUserset
+	_function.GormDB.R.Where("uid = ?", uid).Limit(1).Find(&loopBanSettings)
+
+	reason := ""
+	if len(loopBanSettings) == 0 {
+		reason = "您因为违反吧规，已被吧务封禁，如有疑问请联系吧务！"
+	} else {
+		reason = loopBanSettings[0].C
+	}
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]string{
+		"reason": reason,
+	}, "tbsign"))
+}
+
+func PluginLoopBanSetReason(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	reason := c.FormValue("reason")
+
+	numUID, _ := strconv.ParseInt(uid, 10, 64)
+
+	err := _function.GormDB.W.Model(&model.TcVer4BanUserset{}).Clauses(clause.OnConflict{UpdateAll: true}).Create(&model.TcVer4BanUserset{UID: int32(numUID), C: reason}).Error
+	if err != nil {
+		slog.Debug("plugin.loop-ban.set-reason", "uid", uid, "reason", reason, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法更新封禁理由", map[string]string{
+			"reason": reason,
+		}, "tbsign"))
+	}
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]string{
+		"reason": reason,
+	}, "tbsign"))
+
+}
+
+func PluginLoopBanGetList(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	var loopBanList []*model.TcVer4BanList
+	_function.GormDB.R.Model(&model.TcVer4BanList{}).Where("uid = ?", uid).Order("id ASC").Find(&loopBanList)
+
+	numLimit, _ := strconv.Atoi(_function.GetOption("ver4_ban_limit"))
+
+	var responseList []addAccountsResponseList
+
+	for _, v := range loopBanList {
+		responseList = append(responseList, addAccountsResponseList{
+			ID:       v.ID,
+			PID:      v.Pid,
+			Name:     v.Name,
+			NameShow: v.NameShow,
+			Portrait: v.Portrait,
+			Fname:    v.Tieba,
+			Start:    int64(v.Stime),
+			End:      int64(v.Etime),
+			Success:  true,
+			Log:      v.Log,
+			Date:     v.Date,
+		})
+	}
+
+	var list = struct {
+		Count int64                     `json:"count"`
+		Limit int64                     `json:"limit"`
+		List  []addAccountsResponseList `json:"list"`
+	}{
+		Count: int64(len(responseList)),
+		Limit: int64(numLimit),
+		List:  responseList,
+	}
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", list, "tbsign"))
+}
+
+func PluginLoopBanAddAccounts(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	numUID, _ := strconv.ParseInt(uid, 10, 64)
+	pid := c.FormValue("pid")
+	start := c.FormValue("start")
+	end := c.FormValue("end")
+	fname := c.FormValue("fname")
+	portraits := strings.TrimSpace(c.FormValue("portrait"))
+
+	numPid, err := strconv.ParseInt(pid, 10, 64)
+
+	if err != nil {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "无效 pid", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// time
+	startTime := time.Now()
+	if start != "" {
+		startTime, err = time.Parse(time.DateOnly, start)
+		if err != nil {
+			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "开始日期格式错误", _function.EchoEmptyObject, "tbsign"))
+		}
+	}
+
+	endTime, err := time.Parse(time.DateOnly, end)
+	if err != nil {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "结束日期格式错误", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	if startTime.Unix() >= endTime.Unix() {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "开始时刻晚于结束时刻", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	if endTime.Unix() < time.Now().Unix() {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "现在时刻晚于结束时刻", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// pre check
+	var accountInfo model.TcBaiduid
+	_function.GormDB.R.Model(&model.TcBaiduid{}).Where("id = ? AND uid = ?", pid, uid).Take(&accountInfo)
+	if accountInfo.Portrait == "" {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "无效 pid", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// portrait
+	if portraits == "" {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "待封禁 portrait 列表为空!", _function.EchoEmptyObject, "tbsign"))
+	}
+	portraitList := []string{}
+	for portrait := range strings.SplitSeq(portraits, "\n") {
+		if strings.HasPrefix(portrait, "tb.1.") {
+			portraitList = append(portraitList, portrait)
+		}
+	}
+
+	// limit
+	limit := _function.GetOption("ver4_ban_limit")
+	numLimit, _ := strconv.ParseInt(limit, 10, 64)
+
+	var existsAccountList []*model.TcVer4BanList
+	_function.GormDB.R.Model(&model.TcVer4BanList{}).Where("uid = ?", uid).Order("id ASC").Find(&existsAccountList)
+
+	count := len(existsAccountList)
+	if count >= int(numLimit) || count+len(portraitList) > int(numLimit) {
+		return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, fmt.Sprintf("添加账号数超限（%d/%s）", count+len(portraitList), limit), _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// fid
+	fid := _function.GetFid(fname)
+	if fid == 0 {
+		return c.JSON(http.StatusNotFound, _function.ApiTemplate(404, "贴吧不存在", _function.EchoEmptyObject, "tbsign"))
+	}
+
+	// is manager?
+	if _function.GetOption("ver4_ban_break_check") == "0" {
+		managerStatus, err := _function.GetManagerStatus(_function.GetCookie(int32(numPid)).Portrait, fid)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法获取吧务列表", _function.EchoEmptyObject, "tbsign"))
+		}
+		if !managerStatus.IsManager {
+			return c.JSON(http.StatusForbidden, _function.ApiTemplate(403, "您不是 fname:"+fname+" 的吧务成员", _function.EchoEmptyObject, "tbsign"))
+		}
+	}
+
+	// get account info
+	var accountsResult []addAccountsResponseList
+	var accountsToInsert []*model.TcVer4BanList
+	var successPortraitList []string
+	for _, portrait := range portraitList {
+		// check db
+		dbExists := false
+		for _, v := range existsAccountList {
+			if v.Portrait == portrait {
+				accountsResult = append(accountsResult, addAccountsResponseList{
+					ID:       v.ID,
+					PID:      v.Pid,
+					Name:     v.Name,
+					NameShow: v.NameShow,
+					Portrait: portrait,
+					Fname:    v.Tieba,
+					Start:    int64(v.Stime),
+					End:      int64(v.Etime),
+					Success:  false,
+					Msg:      "账号已存在",
+				})
+				dbExists = true
+				break
+			}
+		}
+		if dbExists {
+			continue
+		}
+
+		// check exists
+		// 一些 bot 账号无法使用旧接口查询 -> https://tieba.baidu.com/f?kw=%E6%8A%93%E8%99%BE
+		banUserInfo, err := _function.GetNewPCUserCard(portrait)
+		if err != nil || banUserInfo.No != 0 {
+			accountsResult = append(accountsResult, addAccountsResponseList{
+				PID:      int32(numPid),
+				Portrait: portrait,
+				Success:  false,
+				Msg:      "无法获取账号信息",
+			})
+		} else {
+			successPortraitList = append(successPortraitList, portrait)
+			accountsToInsert = append(accountsToInsert, &model.TcVer4BanList{
+				UID:      int32(numUID),
+				Pid:      int32(numPid),
+				Name:     "", //banUserInfo.Data.Name,// new pc endpoint doesn't provide this
+				NameShow: banUserInfo.Data.UserInfo.NameShow,
+				Portrait: portrait,
+				Tieba:    fname,
+				Stime:    int32(startTime.Unix()),
+				Etime:    int32(endTime.Unix()),
+				Date:     0,
+			})
+		}
+	}
+
+	if len(accountsToInsert) > 0 {
+		_function.GormDB.W.Create(&accountsToInsert)
+	}
+
+	var loopBanList []*model.TcVer4BanList
+	_function.GormDB.R.Model(&model.TcVer4BanList{}).Where("uid = ? AND portrait IN ?", uid, successPortraitList).Order("id ASC").Find(&loopBanList)
+
+	for _, v := range loopBanList {
+		accountsResult = append(accountsResult, addAccountsResponseList{
+			ID:       v.ID,
+			PID:      v.Pid,
+			Name:     v.Name,
+			NameShow: v.NameShow,
+			Portrait: v.Portrait,
+			Fname:    v.Tieba,
+			Start:    int64(v.Stime),
+			End:      int64(v.Etime),
+			Success:  true,
+			Log:      v.Log,
+			Date:     v.Date,
+		})
+	}
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", accountsResult, "tbsign"))
+}
+
+func PluginLoopBanDelAccount(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	id := c.Param("id")
+
+	numUID, _ := strconv.ParseInt(uid, 10, 64)
+	numID, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无效 id", map[string]any{
+			"success": false,
+			"id":      id,
+		}, "tbsign"))
+	}
+
+	_function.GormDB.W.Model(&model.TcVer4BanList{}).Delete(&model.TcVer4BanList{
+		UID: int32(numUID),
+		ID:  int32(numID),
+	})
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", map[string]any{
+		"success": true,
+		"id":      id,
+	}, "tbsign"))
+}
+
+func PluginLoopBanDelAllAccounts(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	numUID, _ := strconv.ParseInt(uid, 10, 64)
+
+	_function.GormDB.W.Model(&model.TcVer4BanList{}).Delete(&model.TcVer4BanList{
+		UID: int32(numUID),
+	})
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", true, "tbsign"))
+}
