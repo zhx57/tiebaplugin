@@ -1,0 +1,467 @@
+From 505344b64bab904413c11e5091717780aad942b0 Mon Sep 17 00:00:00 2001
+From: Trae <trae@local>
+Date: Sun, 21 Jun 2026 04:24:28 +0000
+Subject: [PATCH] fix(frontend): add weltolk_autoreply plugin page with correct
+ pid binding
+
+---
+ app/pages/plugin/weltolk_autoreply.vue | 447 +++++++++++++++++++++++++
+ 1 file changed, 447 insertions(+)
+ create mode 100644 app/pages/plugin/weltolk_autoreply.vue
+
+diff --git a/app/pages/plugin/weltolk_autoreply.vue b/app/pages/plugin/weltolk_autoreply.vue
+new file mode 100644
+index 0000000..f820f24
+--- /dev/null
++++ b/app/pages/plugin/weltolk_autoreply.vue
+@@ -0,0 +1,447 @@
++<script setup lang="ts">
++import { Notice, Request } from '~/share/Tools'
++import { getPubDate } from '~/share/Time'
++
++const store = useMainStore()
++const pidNameKV = computed(() => store.pidNameKV)
++const loading = computed(() => store.loading)
++
++interface AutoreplyTask {
++    id: number
++    uid: number
++    pid: number
++    fname: string
++    tid: string
++    last_floor: number
++    last_replied_pid: number
++    last_reply_time: number
++    last_status: string
++    last_error: string
++    last_check_time: number
++    log: string
++    reply_content: string
++    reply_interval: number
++    reply_probability: number
++    enabled: number
++    retry_count: number
++    trigger_mode: string
++    reply_target: string
++    allow_replied: number
++    match_keywords: string
++}
++
++const tasksList = ref<AutoreplyTask[]>([])
++const tasksCount = ref<number>(0)
++const tasksLimit = ref<number>(5)
++const loadingTasks = ref<boolean>(false)
++const tasksSwitch = ref<boolean>(false)
++
++const taskToAdd = ref<{
++    pid: number
++    fname: string
++    tid: string
++    reply_content: string
++    reply_interval: number
++    reply_probability: number
++    trigger_mode: string
++    reply_target: string
++    allow_replied: number
++    match_keywords: string
++    enabled: number
++}>({
++    pid: 0,
++    fname: '',
++    tid: '',
++    reply_content: '',
++    reply_interval: 300,
++    reply_probability: 100,
++    trigger_mode: 'new_floor',
++    reply_target: 'floor',
++    allow_replied: 0,
++    match_keywords: '',
++    enabled: 1
++})
++
++const resetTaskToAdd = () => {
++    taskToAdd.value = {
++        pid: 0,
++        fname: '',
++        tid: '',
++        reply_content: '',
++        reply_interval: 300,
++        reply_probability: 100,
++        trigger_mode: 'new_floor',
++        reply_target: 'floor',
++        allow_replied: 0,
++        match_keywords: '',
++        enabled: 1
++    }
++}
++
++const getTasksList = () => {
++    loadingTasks.value = true
++    Request(store.basePath + '/plugins/weltolk_autoreply/list', {
++        headers: {
++            Authorization: store.authorization
++        }
++    })
++        .then((res) => {
++            if (res.code !== 200) {
++                Notice(res.message, 'error')
++                return
++            }
++            tasksList.value = res.data?.tasks || []
++            tasksCount.value = res.data?.count || 0
++            tasksLimit.value = res.data?.limit || 5
++        })
++        .catch((e) => {
++            console.error(e)
++            Notice(e.toString(), 'error')
++        })
++        .finally(() => {
++            loadingTasks.value = false
++        })
++}
++
++const updateTasksSwitch = () => {
++    Request(store.basePath + '/plugins/weltolk_autoreply/switch', {
++        headers: {
++            Authorization: store.authorization
++        },
++        method: 'POST'
++    }).then((res) => {
++        if (res.code !== 200) {
++            Notice(res.message, 'error')
++            return
++        }
++        tasksSwitch.value = res.data
++    })
++}
++
++const addTask = () => {
++    if (!Object.keys(pidNameKV.value).includes(taskToAdd.value.pid.toString())) {
++        Notice('请选择百度账号', 'error')
++        return
++    }
++    if (taskToAdd.value.fname.trim() === '' || taskToAdd.value.tid.trim() === '' || taskToAdd.value.reply_content.trim() === '') {
++        Notice('请填写贴吧名称、帖子ID和回复内容', 'error')
++        return
++    }
++    Request(store.basePath + '/plugins/weltolk_autoreply/list', {
++        headers: {
++            Authorization: store.authorization,
++            'Content-Type': 'application/x-www-form-urlencoded'
++        },
++        method: 'PATCH',
++        body: new URLSearchParams({
++            pid: taskToAdd.value.pid.toString(),
++            fname: taskToAdd.value.fname.trim(),
++            tid: taskToAdd.value.tid.trim(),
++            reply_content: taskToAdd.value.reply_content,
++            reply_interval: taskToAdd.value.reply_interval.toString(),
++            reply_probability: taskToAdd.value.reply_probability.toString(),
++            trigger_mode: taskToAdd.value.trigger_mode,
++            reply_target: taskToAdd.value.reply_target,
++            allow_replied: taskToAdd.value.allow_replied.toString(),
++            match_keywords: taskToAdd.value.match_keywords,
++            enabled: taskToAdd.value.enabled.toString()
++        }).toString()
++    }).then((res) => {
++        if (res.code !== 200) {
++            Notice(res.message, 'error')
++            return
++        }
++        Notice(res.message, 'success')
++        tasksList.value.unshift(res.data)
++        tasksCount.value++
++        resetTaskToAdd()
++    })
++}
++
++const deleteTask = (id = 0) => {
++    if (id <= 0) {
++        return
++    }
++    Request(store.basePath + '/plugins/weltolk_autoreply/list/' + id, {
++        headers: {
++            Authorization: store.authorization
++        },
++        method: 'DELETE'
++    }).then((res) => {
++        if (res.code !== 200) {
++            Notice(res.message, 'error')
++            return
++        }
++        Notice('已删除任务:' + id, 'success')
++        tasksList.value = tasksList.value.filter((x) => x.id !== id)
++        tasksCount.value--
++    })
++}
++
++const emptyTasks = () => {
++    Request(store.basePath + '/plugins/weltolk_autoreply/list/empty', {
++        headers: {
++            Authorization: store.authorization
++        },
++        method: 'POST'
++    }).then((res) => {
++        if (res.code !== 200) {
++            Notice(res.message, 'error')
++            return
++        }
++        Notice('已清空任务', 'success')
++        tasksList.value = []
++        tasksCount.value = 0
++    })
++}
++
++const testTask = (task: AutoreplyTask) => {
++    Request(store.basePath + '/plugins/weltolk_autoreply/test', {
++        headers: {
++            Authorization: store.authorization,
++            'Content-Type': 'application/x-www-form-urlencoded'
++        },
++        method: 'POST',
++        body: new URLSearchParams({
++            pid: task.pid.toString(),
++            fname: task.fname,
++            tid: task.tid,
++            reply_content: task.reply_content,
++            trigger_mode: task.trigger_mode,
++            reply_target: task.reply_target,
++            allow_replied: task.allow_replied.toString(),
++            match_keywords: task.match_keywords
++        }).toString()
++    }).then((res) => {
++        if (res.code !== 200) {
++            Notice(res.message, 'error')
++            return
++        }
++        if (res.data?.success) {
++            Notice('测试发帖成功', 'success')
++        } else {
++            Notice('测试发帖失败: [' + (res.data?.error_code || '?') + '] ' + (res.data?.error_msg || ''), 'error')
++        }
++    })
++}
++
++const formatTime = (ts: number): string => {
++    if (!ts || ts <= 0) {
++        return '-'
++    }
++    return getPubDate(new Date(ts * 1000))
++}
++
++const statusClass = (status: string): string => {
++    switch (status) {
++        case 'ok':
++            return 'text-green-500'
++        case 'error':
++            return 'text-red-500'
++        case 'vcode':
++            return 'text-yellow-500'
++        case 'skipped':
++            return 'text-gray-500'
++        default:
++            return ''
++    }
++}
++
++const triggerModeText = (mode: string): string => {
++    return mode === 'keyword' ? '关键词' : '新楼层'
++}
++
++const replyTargetText = (target: string): string => {
++    return target === 'subpost' ? '楼中楼' : '楼层'
++}
++
++onMounted(() => {
++    getTasksList()
++
++    Request(store.basePath + '/plugins/weltolk_autoreply/switch', {
++        headers: {
++            Authorization: store.authorization
++        }
++    }).then((res) => {
++        if (res.code !== 200) {
++            Notice(res.message, 'error')
++            return
++        }
++        tasksSwitch.value = res.data
++    })
++})
++</script>
++
++<template>
++    <div class="px-3 py-2">
++        <div class="rounded-2xl bg-gray-200 dark:bg-gray-800 p-5 mb-2">
++            <ul class="col-span-2 md:col-span-1 list-disc list-inside marker:text-pink-500">
++                <li>触发模式为<span class="font-bold">新楼层</span>时，将在检测到新楼层后自动回复最新楼层</li>
++                <li>触发模式为<span class="font-bold">关键词</span>时，将扫描最新 20 层并回复匹配关键词的楼层</li>
++                <li>回复内容可用变量：<span class="font-mono">{floor}</span>、<span class="font-mono">{time}</span>、<span class="font-mono">{date}</span>、<span class="font-mono">{tid}</span>、<span class="font-mono">{username}</span></li>
++            </ul>
++        </div>
++
++        <h3 class="text-2xl mb-4">设置</h3>
++
++        <button
++            :class="{ 'bg-sky-500': !tasksSwitch, 'bg-pink-500': tasksSwitch, 'rounded-lg': true, 'px-3': true, 'py-1': true, 'text-gray-100': true, 'transition-colors': true }"
++            @click="updateTasksSwitch"
++        >
++            {{ tasksSwitch ? '已开启' : '已停止' }}
++        </button>
++    </div>
++
++    <div class="px-3 py-2">
++        <h4 class="text-xl">任务列表（{{ tasksCount }}/{{ tasksLimit }}）</h4>
++
++        <div class="my-5 grid grid-cols-6 gap-2 max-w-[48em]">
++            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" title="添加自动回帖任务">
++                <template #default>
++                    <button class="w-full rounded-2xl border-2 border-gray-300 hover:bg-gray-300 px-4 py-1 hover:text-black transition-colors" title="添加自动回帖任务">添加任务</button>
++                </template>
++                <template #container>
++                    <div class="my-3">
++                        <label for="pid-to-autoreply">百度账号</label>
++                        <select id="pid-to-autoreply" v-model="taskToAdd.pid" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
++                            <option v-for="(name, pid) in pidNameKV" :key="pid" :value="Number(pid)">{{ name }}</option>
++                        </select>
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-fname">贴吧名称</label>
++                        <input id="autoreply-fname" class="form-input bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1" type="text" v-model="taskToAdd.fname" placeholder="输入贴吧名（不带末尾吧字）" />
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-tid">帖子 ID</label>
++                        <input id="autoreply-tid" class="form-input bg-gray-200 dark:bg-gray-900 dark:[color-scheme:dark] w-full rounded-xl mt-1" type="text" v-model="taskToAdd.tid" placeholder="tid" />
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-trigger">触发模式</label>
++                        <select id="autoreply-trigger" v-model="taskToAdd.trigger_mode" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
++                            <option value="new_floor">新楼层</option>
++                            <option value="keyword">关键词</option>
++                        </select>
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-target">回复目标</label>
++                        <select id="autoreply-target" v-model="taskToAdd.reply_target" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
++                            <option value="floor">楼层</option>
++                            <option value="subpost">楼中楼</option>
++                        </select>
++                    </div>
++
++                    <div class="my-3" v-if="taskToAdd.trigger_mode === 'keyword'">
++                        <label for="autoreply-keywords">匹配关键词</label>
++                        <p class="text-sm my-1">每行一个关键词</p>
++                        <textarea id="autoreply-keywords" class="form-textarea bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1" v-model="taskToAdd.match_keywords" rows="3" placeholder="关键词"></textarea>
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-content">回复内容</label>
++                        <textarea id="autoreply-content" class="form-textarea bg-gray-200 dark:bg-gray-900 w-full rounded-xl mt-1" v-model="taskToAdd.reply_content" rows="3" placeholder="回复内容"></textarea>
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-interval">回复间隔（秒）</label>
++                        <input id="autoreply-interval" class="form-input bg-gray-200 dark:bg-gray-900 dark:[color-scheme:dark] w-full rounded-xl mt-1" type="number" min="0" v-model="taskToAdd.reply_interval" />
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-probability">回复概率（%）</label>
++                        <input id="autoreply-probability" class="form-input bg-gray-200 dark:bg-gray-900 dark:[color-scheme:dark] w-full rounded-xl mt-1" type="number" min="1" max="100" v-model="taskToAdd.reply_probability" />
++                    </div>
++
++                    <div class="my-3">
++                        <label for="autoreply-allow-replied">允许重复回复</label>
++                        <select id="autoreply-allow-replied" v-model="taskToAdd.allow_replied" class="bg-gray-200 dark:bg-gray-900 dark:text-gray-100 form-select block w-full mt-1 rounded-xl">
++                            <option :value="0">否</option>
++                            <option :value="1">是</option>
++                        </select>
++                    </div>
++
++                    <button class="px-3 py-1 rounded-lg my-2 bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 text-gray-100 transition-colors" @click="addTask">保存</button>
++                </template>
++            </Modal>
++
++            <Modal class="col-span-6 sm:col-span-3 lg:col-span-1" title="确认清空所有自动回帖任务？">
++                <template #default>
++                    <button class="w-full rounded-2xl border-2 border-pink-300 hover:bg-pink-300 px-4 py-1 hover:text-black transition-colors" title="清空任务">清空任务</button>
++                </template>
++                <template #container>
++                    <button class="bg-pink-500 hover:bg-pink-600 px-3 py-1 rounded-lg transition-colors text-gray-100 w-full text-lg" @click="emptyTasks">确认清空</button>
++                </template>
++            </Modal>
++        </div>
++
++        <div v-if="loadingTasks" class="w-full h-32 rounded-xl bg-gray-300 dark:bg-gray-700 animate-pulse"></div>
++        <template v-else>
++            <div v-if="tasksList.length === 0" class="text-gray-500 my-3">暂无任务</div>
++            <div class="border-4 border-gray-400 dark:border-gray-700 rounded-xl p-5 my-3" v-for="task in tasksList" :key="task.id">
++                <ul class="marker:text-sky-500 list-disc list-inside">
++                    <li>
++                        <span class="font-bold">百度账号 : </span>
++                        <NuxtLink class="font-mono hover:underline underline-offset-1" :to="'https://tieba.baidu.com/home/main?un=' + pidNameKV[task.pid]" target="_blank">{{ pidNameKV[task.pid] || task.pid }}</NuxtLink>
++                    </li>
++                    <li>
++                        <span class="font-bold">执行贴吧 : </span>
++                        <NuxtLink class="font-mono hover:underline underline-offset-1" :to="'https://tieba.baidu.com/f?ie=utf-8&kw=' + task.fname" target="_blank">{{ task.fname }}</NuxtLink>
++                    </li>
++                    <li>
++                        <span class="font-bold">任务帖子 : </span>
++                        <NuxtLink class="font-mono underline underline-offset-2" :to="'https://tieba.baidu.com/p/' + task.tid" target="_blank">{{ task.tid }}</NuxtLink>
++                    </li>
++                    <li>
++                        <span class="font-bold">触发模式 : </span><span class="font-mono">{{ triggerModeText(task.trigger_mode) }} / {{ replyTargetText(task.reply_target) }}</span>
++                    </li>
++                    <li>
++                        <span class="font-bold">回复间隔 : </span><span class="font-mono">{{ task.reply_interval }} 秒</span>
++                    </li>
++                    <li>
++                        <span class="font-bold">回复概率 : </span><span class="font-mono">{{ task.reply_probability }}%</span>
++                    </li>
++                    <li>
++                        <span class="font-bold">上次状态 : </span><span class="font-mono" :class="statusClass(task.last_status)">{{ task.last_status || '-' }}</span>
++                    </li>
++                    <li v-if="task.last_error">
++                        <span class="font-bold">上次错误 : </span><span class="font-mono text-red-400">{{ task.last_error }}</span>
++                    </li>
++                    <li>
++                        <span class="font-bold">上次检查 : </span><span class="font-mono">{{ formatTime(task.last_check_time) }}</span>
++                    </li>
++                    <li>
++                        <span class="font-bold">上次回复 : </span><span class="font-mono">{{ formatTime(task.last_reply_time) }}</span>
++                    </li>
++                    <li>
++                        <span class="font-bold">最后楼层 : </span><span class="font-mono">{{ task.last_floor || '-' }} / PID {{ task.last_replied_pid || '-' }}</span>
++                    </li>
++                </ul>
++
++                <hr class="border-gray-400 dark:border-gray-600 my-3" />
++                <Modal class="inline-block mr-1" :title="'确认删除自动回帖任务: ' + task.fname + ' ？'">
++                    <template #default>
++                        <button class="bg-pink-500 hover:bg-pink-600 dark:hover:bg-pink-400 rounded-lg px-3 py-1 text-gray-100 transition-colors">删除</button>
++                    </template>
++                    <template #container>
++                        <button class="bg-pink-500 hover:bg-pink-600 px-3 py-1 rounded-lg transition-colors text-gray-100 w-full text-lg" @click="deleteTask(task.id)">确认删除</button>
++                    </template>
++                </Modal>
++                <Modal class="mx-1 inline-block" :title="'@' + (pidNameKV[task.pid] || task.pid) + ' 自动回帖任务记录'">
++                    <template #default>
++                        <button class="rounded-lg bg-gray-300 hover:bg-gray-400 dark:bg-gray-700 dark:hover:bg-gray-600 px-3 py-1 text-gray-900 dark:text-gray-100 transition-colors" title="日志">日志</button>
++                    </template>
++                    <template #container>
++                        <div class="rounded-lg bg-gray-300 dark:bg-gray-800 px-5 py-3 mb-3 overflow-auto max-h-[60vh]">
++                            <div class="text-sm font-mono whitespace-pre-wrap" v-html="task.log || '暂无日志'"></div>
++                        </div>
++                    </template>
++                </Modal>
++                <button class="mx-1 rounded-lg bg-sky-500 hover:bg-sky-600 dark:hover:bg-sky-400 px-3 py-1 text-gray-100 transition-colors" @click="testTask(task)">测试发帖</button>
++            </div>
++        </template>
++    </div>
++    <SyncModule :loading="loading" :callback="getTasksList" />
++</template>
+-- 
+2.43.0
+
