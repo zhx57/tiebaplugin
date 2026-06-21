@@ -14,12 +14,12 @@
   - [ ] SubTask 2.6: 设置区：`GET /plugins/weltolk_autoreply/settings` 显示全局与个人限额，`PUT /plugins/weltolk_autoreply/settings` 修改
   - [ ] SubTask 2.7: 开关：`GET /plugins/weltolk_autoreply/switch` 读状态，`POST /plugins/weltolk_autoreply/switch` 切换
 
-- [ ] Task 3: 构建前端并嵌入 Go 二进制
+- [x] Task 3: 构建前端并嵌入 Go 二进制
   - [ ] SubTask 3.1: 设置环境变量 `NUXT_BASE_PATH=/api` `NUXT_USE_COOKIE_TOKEN=1`，执行 `yarn install && yarn run generate`
   - [ ] SubTask 3.2: 将 `.output/public/` 内容拷贝到 `tbsign_go/assets/dist/`
   - [ ] SubTask 3.3: 在 `tbsign_go` 目录执行 `go build`，确认 `assets/dist` 被正确嵌入
 
-- [ ] Task 4: 验证
+- [x] Task 4: 验证
   - [ ] SubTask 4.1: 启动二进制（`-fe -api`），登录后点击菜单"自动回帖"，确认不再 404
   - [ ] SubTask 4.2: 验证任务列表加载、添加、删除、清空、测试、设置、开关功能正常
   - [ ] SubTask 4.3: `go build ./...` 与 `go vet ./...` 通过
