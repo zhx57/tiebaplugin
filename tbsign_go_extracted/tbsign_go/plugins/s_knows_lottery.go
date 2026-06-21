@@ -1,0 +1,353 @@
+package _plugin
+
+import (
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"regexp"
+	"slices"
+	"strconv"
+	"time"
+
+	_function "github.com/BANKA2017/tbsign_go/functions"
+	"github.com/BANKA2017/tbsign_go/model"
+	_type "github.com/BANKA2017/tbsign_go/types"
+	"github.com/labstack/echo/v4"
+	"gorm.io/gorm"
+)
+
+func init() {
+	PluginList.Register(LotteryPluginPlugin)
+}
+
+type LotteryPluginPluginType struct {
+	PluginInfo
+}
+
+var LotteryPluginPlugin = _function.VPtr(LotteryPluginPluginType{
+	PluginInfo{
+		Name:              "ver4_lottery",
+		PluginNameCN:      "知道商城抽奖",
+		PluginNameCNShort: "知道商城",
+		PluginNameFE:      "knows_lottery",
+		Version:           "1.0",
+		Options: map[string]string{
+			"ver4_lottery_pid": "0",
+			"ver4_lottery_day": "0",
+		},
+		Endpoints: []PluginEndpointStruct{
+			{Method: http.MethodGet, Path: "switch", Function: PluginKnowsLotteryGetSwitch},
+			{Method: http.MethodPost, Path: "switch", Function: PluginKnowsLotterySwitch},
+			{Method: http.MethodGet, Path: "log", Function: PluginKnowsLotteryGetLogs},
+		},
+	},
+})
+
+type GetLotteryResponse struct {
+	Errno int `json:"errno,omitempty"`
+	Data  *struct {
+		PrizeList []struct {
+			GoodsName string `json:"goodsName,omitempty"`
+		} `json:"prizeList,omitempty"`
+	} `json:"data,omitempty"`
+	Errmsg string `json:"errmsg,omitempty"`
+}
+
+func GetLotteryToken(cookie *_type.TypeCookie) (string, error) {
+	headersMap := map[string]string{
+		"Cookie": "BDUSS=" + cookie.Bduss,
+	}
+	resp, err := _function.TBFetch("https://zhidao.baidu.com/shop/lottery", http.MethodGet, []byte{}, headersMap)
+	if err != nil {
+		return "", err
+	}
+
+	for _, match := range regexp.MustCompile(`(?m)'luckyToken',(?:\s+|)'([^']+)'`).FindAllSubmatch(resp, -1) {
+		return string(match[1]), nil
+	}
+	return "", errors.New("get_lottery_token: No token")
+}
+
+func GetLottery(cookie *_type.TypeCookie, token string) (*GetLotteryResponse, error) {
+	headersMap := map[string]string{
+		"Cookie":   "BDUSS=" + cookie.Bduss,
+		"x-ik-ssl": "1",
+		"Referer":  "https://zhidao.baidu.com/shop/lottery",
+	}
+
+	body := url.Values{
+		"type":  []string{"0"},
+		"token": []string{token},
+	}
+
+	response, err := _function.TBFetch("https://zhidao.baidu.com/shop/submit/lottery", http.MethodPost, []byte(body.Encode()), headersMap)
+	if err != nil {
+		return nil, err
+	}
+
+	// slog.Debug("plugin.knows-lottery.get-lottery", "response", string(response))
+
+	resp := new(GetLotteryResponse)
+	err = _function.JsonDecode(response, resp)
+	return resp, err
+}
+
+var notCompleteActionPid = make(map[int32]struct{}, 0)
+
+func (pluginInfo *LotteryPluginPluginType) Action() {
+	if !pluginInfo.PluginInfo.CheckActive() {
+		return
+	}
+	defer pluginInfo.PluginInfo.SetActive(false)
+
+	id := _function.GetOption("ver4_lottery_pid")
+
+	// 10 am gmt+8
+	stime := _function.LocaleTimeDiff(10)
+
+	queryLotteryLogs := _function.GormDB.R.Model(&model.TcVer4LotteryLog{}).Select("pid").Where("date >= ?", stime).Where("pid > ?", id).Group("pid").Having("max(date) >= ? OR COUNT(*) >= ?", time.Now().Add(time.Minute*-10).Unix(), 2)
+
+	queryUserOptions := _function.GormDB.R.Model(&model.TcUsersOption{}).Select("uid").Where("name='ver4_lottery_check' AND value = '1'")
+
+	var accounts []*model.TcBaiduid
+
+	waitSeconds := 2 // wait 2s// should not <=1
+	limit := 60
+
+	if waitSeconds < 1 {
+		waitSeconds = 1
+	} else {
+		limit = limit / waitSeconds
+	}
+
+	_function.GormDB.R.Model(&model.TcBaiduid{}).Select("id", "name", "portrait").Where("id > ? AND id NOT IN (?) AND uid IN (?)", id, queryLotteryLogs, queryUserOptions).Order("id").Limit(limit).Find(&accounts)
+
+	if len(accounts) > 0 {
+		for i, account := range accounts {
+			if i > 0 {
+				time.Sleep(time.Second * time.Duration(waitSeconds))
+			}
+			cookie := _function.GetCookie(account.ID)
+			dataToInsert := model.TcVer4LotteryLog{
+				UID:   cookie.UID,
+				Pid:   account.ID,
+				Date:  int32(time.Now().Unix()),
+				Prize: "-",
+			}
+
+			if !cookie.IsLogin {
+				dataToInsert.Result = "请先登录~"
+				slog.Error("请先登录~ (plugin.knows-lottery.login)", "uid", dataToInsert.UID, "pid", dataToInsert.Pid)
+				delete(notCompleteActionPid, account.ID)
+			} else {
+				token, err := GetLotteryToken(cookie)
+				if err != nil || token == "" {
+					dataToInsert.Result = "无法获取 token"
+					slog.Error("无法获取 token (plugin.knows-lottery.get-lottery-token)", "error", err)
+				}
+
+				_, hasNotCompleted := notCompleteActionPid[account.ID]
+
+				resp, err := GetLottery(cookie, token)
+				if err != nil && (resp == nil || resp.Data == nil) {
+					dataToInsert.Result = "无法解析物品信息"
+					if hasNotCompleted {
+						delete(notCompleteActionPid, account.ID)
+					}
+					slog.Error("无法解析物品信息 (plugin.knows-lottery.get-lottery)", "response", resp, "error", err)
+				} else if err != nil && resp.Errno == 0 && len(resp.Data.PrizeList) == 0 {
+					if hasNotCompleted {
+						dataToInsert.Result = "未完成抽奖"
+						delete(notCompleteActionPid, account.ID)
+						slog.Error("第二次未完成抽奖 (plugin.knows-lottery.get-lottery)", "id", account.ID, "name", account.Name, "portrait", account.Portrait)
+					} else {
+						slog.Error("第一次未完成抽奖 (plugin.knows-lottery.get-lottery)", "id", account.ID, "name", account.Name, "portrait", account.Portrait)
+						notCompleteActionPid[account.ID] = struct{}{}
+					}
+				} else if resp.Errno != 0 {
+					dataToInsert.Result = resp.Errmsg
+					if hasNotCompleted {
+						delete(notCompleteActionPid, account.ID)
+					}
+				} else {
+					dataToInsert.Prize = resp.Data.PrizeList[0].GoodsName
+					if hasNotCompleted {
+						delete(notCompleteActionPid, account.ID)
+					}
+				}
+			}
+
+			_function.GormDB.W.Create(&dataToInsert)
+			_function.SetOption("ver4_lottery_pid", strconv.Itoa(int(account.ID)))
+		}
+	} else {
+		_function.SetOption("ver4_lottery_pid", "0")
+	}
+
+	latestDay := _function.GetOption("ver4_lottery_day")
+	nowDate := time.Now().Day()
+	if latestDay != strconv.Itoa(nowDate) {
+		err := _function.GormDB.W.Where("date <= ?", time.Now().Add(time.Hour*-24*30).Unix()).Delete(&model.TcVer4LotteryLog{}).Error
+		if err != nil {
+			slog.Error("plugin.knows-lottery.reset-logs", "error", err)
+		}
+		_function.SetOption("ver4_lottery_day", nowDate)
+	}
+}
+
+func (pluginInfo *LotteryPluginPluginType) Install() error {
+	for k, v := range pluginInfo.Options {
+		_function.SetOption(k, v)
+	}
+	UpdatePluginInfo(pluginInfo.Name, pluginInfo.Version, false, "")
+
+	return _function.GormDB.W.Migrator().CreateTable(&model.TcVer4LotteryLog{})
+}
+
+func (pluginInfo *LotteryPluginPluginType) Delete() error {
+	for k := range pluginInfo.Options {
+		_function.DeleteOption(k)
+	}
+	DeletePluginInfo(pluginInfo.Name)
+	_function.GormDB.W.Migrator().DropTable(&model.TcVer4LotteryLog{})
+
+	// user options
+	_function.GormDB.W.Where("name = ?", "ver4_lottery_check").Delete(&model.TcUsersOption{})
+
+	return nil
+}
+func (pluginInfo *LotteryPluginPluginType) Upgrade() error {
+	return nil
+}
+
+func (pluginInfo *LotteryPluginPluginType) RemoveAccount(_type string, id int32, tx *gorm.DB) error {
+	_sql := _function.GormDB.W
+	if tx != nil {
+		_sql = tx
+	}
+	return _sql.Where(_type+" = ?", id).Delete(&model.TcVer4LotteryLog{}).Error
+}
+
+func (pluginInfo *LotteryPluginPluginType) Report(int32, *gorm.DB) (string, error) {
+	return "", nil
+}
+
+func (pluginInfo *LotteryPluginPluginType) Reset(uid, pid, tid int32) error {
+	if uid == 0 {
+		return errors.New("invalid uid")
+	}
+
+	_sql := _function.GormDB.W.Where("uid = ?", uid)
+	if pid != 0 {
+		_sql = _sql.Where("pid = ?", pid)
+	}
+
+	return _sql.Where("date >= ?", _function.LocaleTimeDiff(10)).Delete(&model.TcVer4LotteryLog{}).Error
+}
+
+func (pluginInfo *LotteryPluginPluginType) ExportAccount(uid int32, tx *gorm.DB) (map[string]any, error) {
+	if !pluginInfo.GetSwitch() {
+		return nil, nil
+	}
+
+	tableName := (&model.TcVer4LotteryLog{}).TableName()
+	var exportData []*model.TcVer4LotteryLog
+
+	if tx == nil {
+		tx = _function.GormDB.R
+	}
+
+	err := tx.Model(&model.TcVer4LotteryLog{}).Where("uid = ?", uid).Find(&exportData).Error
+
+	return map[string]any{
+		tableName: exportData,
+		"tc_users_options": _function.GetUserOptionBatch(strconv.Itoa(int(uid)), _function.OptionExt{
+			Tx:      tx,
+			KeyName: "ver4_lottery_check",
+		}),
+	}, err
+}
+
+func (pluginInfo *LotteryPluginPluginType) ImportAccount(uid int32, pid map[int32]int32, data map[string]json.RawMessage, tx *gorm.DB) error {
+	if !pluginInfo.GetSwitch() {
+		return errors.New("plugin is not enabled")
+	}
+
+	if tx == nil {
+		tx = _function.GormDB.W
+	}
+
+	tableName := (&model.TcVer4LotteryLog{}).TableName()
+
+	var data2 []*model.TcVer4LotteryLog
+	if err := _function.JsonDecode(data[tableName], &data2); err != nil {
+		return errors.New("invalid data format")
+	}
+
+	var data3 []*model.TcVer4LotteryLog
+
+	var localTasks []*model.TcVer4LotteryLog
+	_function.GormDB.R.Model(&model.TcVer4LotteryLog{}).Select("pid", "date").Where("uid = ?", uid).Find(&localTasks)
+
+	pidDateMap := make(map[int32][]int32)
+
+	for _, task := range localTasks {
+		if _, ok := pidDateMap[task.Pid]; !ok {
+			pidDateMap[task.Pid] = []int32{}
+		}
+		pidDateMap[task.Pid] = append(pidDateMap[task.Pid], task.Date)
+	}
+
+	for i := range data2 {
+		if pid, ok := pid[data2[i].Pid]; ok {
+			if timestamp, ok := pidDateMap[pid]; !ok || !slices.Contains(timestamp, data2[i].Date) {
+				data2[i].Pid = pid
+				data2[i].ID = 0
+				data2[i].UID = uid
+				data3 = append(data3, data2[i])
+			}
+		}
+	}
+
+	if len(data3) == 0 {
+		return nil
+	}
+
+	return tx.Model(&model.TcVer4LotteryLog{}).Create(data3).Error
+}
+
+// endpoint
+
+func PluginKnowsLotteryGetLogs(c echo.Context) error {
+	uid := c.Get("uid").(string)
+
+	var _log []*model.TcVer4LotteryLog
+	_function.GormDB.R.Model(&model.TcVer4LotteryLog{}).Where("uid = ?", uid).Order("id DESC").Find(&_log)
+
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", _log, "tbsign"))
+}
+
+func PluginKnowsLotteryGetSwitch(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	status := _function.GetUserOption("ver4_lottery_check", uid)
+	if status == "" {
+		status = "0"
+		_function.SetUserOption("ver4_lottery_check", status, uid)
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", status != "0", "tbsign"))
+}
+
+func PluginKnowsLotterySwitch(c echo.Context) error {
+	uid := c.Get("uid").(string)
+	status := _function.GetUserOption("ver4_lottery_check", uid) != "0"
+
+	err := _function.SetUserOption("ver4_lottery_check", !status, uid)
+
+	if err != nil {
+		slog.Debug("plugin.knows-lottery.switch", "uid", uid, "current_status", status, "error", err)
+		return c.JSON(http.StatusInternalServerError, _function.ApiTemplate(500, "无法修改知道商城抽奖插件状态", status, "tbsign"))
+	}
+	return c.JSON(http.StatusOK, _function.ApiTemplate(200, "OK", !status, "tbsign"))
+}

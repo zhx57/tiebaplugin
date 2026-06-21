@@ -1,0 +1,233 @@
+package _function
+
+import (
+	crypto_rand "crypto/rand"
+	"encoding/base64"
+	"log/slog"
+	"math/rand/v2"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/BANKA2017/tbsign_go/assets"
+	"github.com/BANKA2017/tbsign_go/model"
+	"github.com/BANKA2017/tbsign_go/share"
+	_type "github.com/BANKA2017/tbsign_go/types"
+	"github.com/go-co-op/gocron/v2"
+	"github.com/jellydator/ttlcache/v3"
+	"golang.org/x/mod/semver"
+	"golang.org/x/sync/singleflight"
+
+	"maps"
+	_ "time/tzdata"
+)
+
+// Tieba works in GMT+8
+func init() {
+	loc, _ := time.LoadLocation("Asia/Shanghai")
+	time.Local = loc
+}
+
+var Options = NewKV[string, string]() //  make(map[string]string)
+var CookieList = NewKV(
+	ttlcache.WithCapacity[int32, *_type.TypeCookie](100),
+) //= make(map[int32]_type.TypeCookie)
+var FidList = NewKV(
+	ttlcache.WithCapacity[string, int64](500),
+) //= make(map[string]int64)
+
+const ResetPwdMaxTimes = 5
+const ResetPwdExpire = 60 * 5 // 5 mins
+
+var syncCookieTasks singleflight.Group
+
+// ext [bduss_only, force_sync]
+func GetCookie(pid int32, ext ...bool) *_type.TypeCookie {
+	cookie, ok := CookieList.Load(pid)
+	bdussOnly := len(ext) >= 1 && ext[0]
+	forceSync := len(ext) >= 2 && ext[1]
+
+	if !ok || forceSync {
+		_cookie, _, _ := syncCookieTasks.Do(strconv.Itoa(int(pid))+When(forceSync, "1", "0"), func() (any, error) {
+			var _cookie = new(_type.TypeCookie)
+			var cookieDB model.TcBaiduid
+			GormDB.R.Model(&model.TcBaiduid{}).Where("id = ?", pid).Take(&cookieDB)
+
+			if len(share.DataEncryptKeyByte) > 0 {
+				decryptedBDUSS, _ := AES256GCMDecrypt(cookieDB.Bduss, share.DataEncryptKeyByte, []byte(cookieDB.Portrait))
+				cookieDB.Bduss = string(decryptedBDUSS)
+
+				decryptedStoken, _ := AES256GCMDecrypt(cookieDB.Stoken, share.DataEncryptKeyByte, []byte(cookieDB.Portrait))
+				cookieDB.Stoken = string(decryptedStoken)
+			}
+
+			_cookie.ID = cookieDB.ID
+			_cookie.Name = cookieDB.Name
+			_cookie.Portrait = cookieDB.Portrait
+			_cookie.UID = cookieDB.UID
+
+			if bdussOnly {
+				_cookie.Bduss = cookieDB.Bduss
+				_cookie.Stoken = cookieDB.Stoken
+				_cookie.IsLogin = true
+				return _cookie, nil
+			}
+
+			// not login
+			if ok && !forceSync && cookieDB.Bduss == cookie.Bduss && !cookie.IsLogin {
+				return cookie, nil
+			}
+
+			tbsResponse, err := GetTbs(cookieDB.Bduss)
+			if err != nil {
+				return _cookie, nil
+			}
+			_cookie.IsLogin = tbsResponse.IsLogin != 0
+			_cookie.Tbs = tbsResponse.Tbs
+			_cookie.Stoken = cookieDB.Stoken
+			_cookie.Bduss = cookieDB.Bduss
+			CookieList.Store(pid, _cookie, 60*60*4)
+			return _cookie, nil
+		})
+		return _cookie.(*_type.TypeCookie)
+	}
+
+	return cookie
+}
+
+var syncFidTasks singleflight.Group
+
+func GetFid(name string) int64 {
+	fid, ok := FidList.Load(name)
+	if !ok || fid == 0 {
+		_fid, _, _ := syncFidTasks.Do(name, func() (any, error) {
+			// find in db
+			var fids []int32
+			GormDB.R.Model(&model.TcTieba{}).Where("tieba = ? AND fid IS NOT NULL AND fid != '' AND fid != 0", name).Group("fid").Pluck("fid", &fids)
+
+			var _fid int64
+			if len(fids) == 1 {
+				_fid = int64(fids[0])
+			}
+
+			if _fid == 0 {
+				forumNameInfo, err := GetForumNameShare(name)
+				if err != nil {
+					slog.Error("get-fid", "name", name, "error", err)
+				}
+				_fid = int64(forumNameInfo.Data.Fid)
+			}
+			FidList.Store(name, _fid, 60*60*4)
+			return _fid, nil
+		})
+		return _fid.(int64)
+	}
+	return fid
+}
+
+func InitOptions() {
+	// get db options
+	var tmpOptions []*model.TcOption
+
+	GormDB.R.Find(&tmpOptions)
+
+	// sync options
+	defaultOptionsCopy := make(map[string]string)
+	if len(tmpOptions) != len(assets.DefaultOptions) {
+		maps.Copy(defaultOptionsCopy, assets.DefaultOptions)
+	}
+
+	for _, v := range tmpOptions {
+		Options.Store(v.Name, v.Value, -1)
+		delete(defaultOptionsCopy, v.Name)
+	}
+
+	// sync options
+	for k, v := range defaultOptionsCopy {
+		SetOption(k, v)
+	}
+}
+
+// for GMT+8
+func LocaleTimeDiff(hour int64) int64 {
+	now := time.Now()
+	targetTime := time.Date(now.Year(), now.Month(), now.Day(), int(hour), 0, 0, 0, now.Location())
+
+	if now.Before(targetTime) {
+		targetTime = targetTime.Add(-24 * time.Hour)
+	}
+
+	return targetTime.Unix()
+}
+
+func VariableWrapper[T any](anyValue T) T {
+	return anyValue
+}
+
+func VPtr[T any](anyValue T) *T {
+	return &anyValue
+}
+
+func GetGravatarLink(email string) string {
+	return "https://www.gravatar.com/avatar/" + Sha256(email)
+}
+
+func NewerSemver(cur, ver2 string) string {
+	cver := When(strings.HasPrefix(strings.ToLower(cur), "v"), "", "v") + strings.ToLower(cur)
+	nver := When(strings.HasPrefix(strings.ToLower(ver2), "v"), "", "v") + strings.ToLower(ver2)
+
+	if semver.Compare(cver, nver) == 1 {
+		return cur
+	} else {
+		return ver2
+	}
+}
+
+func VerifyURL(_url string) bool {
+	_, err := url.ParseRequestURI(_url)
+	return err == nil
+}
+
+func RandomEmoji() string {
+	emojiMap := []string{"💻", "✅", "➡️", "🎉", "🤖", "🐱", "⚙️", "😊", "📌", "✒️", "⌛", "🔔"}
+	randNum := rand.Perm(len(emojiMap))
+
+	var resStr []string
+	for _, v := range randNum[:3] {
+		resStr = append(resStr, emojiMap[v])
+	}
+	return strings.Join(resStr, "")
+}
+
+func RandomTokenBuilder(n int64) ([]byte, error) {
+	token := make([]byte, n)
+
+	_, err := crypto_rand.Read(token)
+	return token, err
+}
+
+func TinyIntToBool(t int) bool {
+	return t != 0
+}
+func BoolToTinyInt(b bool) int {
+	return When(b, 1, 0)
+}
+
+func When[T any](c bool, d1, d2 T) T {
+	if c {
+		return d1
+	} else {
+		return d2
+	}
+}
+
+func Base64URLEncode(originalBuffer []byte) string {
+	return base64.RawURLEncoding.EncodeToString(originalBuffer)
+}
+
+func Base64URLDecode(originalBuffer string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(strings.ReplaceAll(originalBuffer, "=", ""))
+}
+
+var Crontab gocron.Scheduler
