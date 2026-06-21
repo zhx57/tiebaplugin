@@ -1,0 +1,16 @@
+node_modules
+*.log*
+.idea
+.vscode
+.nuxt
+.nitro
+.cache
+.output
+.env
+.yarn
+dist
+
+.vercel
+
+public/
+README.md
